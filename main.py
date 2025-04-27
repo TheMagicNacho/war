@@ -1,5 +1,6 @@
 from uuid import uuid4 as uuid
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.decomposition import PCA
 import numpy as np
 
@@ -28,6 +29,12 @@ radius: float # the radius of a dimension. The implication is then that the mani
 """
 class Mainfold:
     def __init__(self, dimensions: int, radius: float = 1.0):
+        if dimensions < 1:
+            raise ValueError("Dimensions must be greater than 0")
+        if dimensions > 4:
+            raise ValueError("Dimensions must be less than or equal to 4")
+        
+
         self.dimensions: int = dimensions
         self.entities: dict = {}
         self.radius: int = radius
@@ -51,6 +58,10 @@ class Mainfold:
     return True if the entity was added, False otherwise.
     """
     def add_entity(self, entity: Entity, position: tuple) -> bool:
+        if len(position) != self.dimensions:
+            raise ValueError(f"Position must be of length {self.dimensions}")
+
+
         if not self.is_position_valid(position):
             print(f"Position {position} is out of bounds for manifold of radius {self.radius}")
             return False
@@ -162,191 +173,184 @@ class HumanVision:
         fig.show()
 
     def plot_hypersphere(self, manifold: Mainfold):
-        """
-        Visualize a high-dimensional manifold (n > 3) using stereographic projection
-        and interactive sliders for quaternion-based rotation angles (wx, wy, wz).
-        Also draws lines along each axis to help visualize the boundary of the hypersphere.
-        """
-        import plotly.graph_objects as go
-        import numpy as np
-        from scipy.spatial.transform import Rotation as R
-
+    
+        # Extract entity positions and properties
         positions = np.array([pos for _, pos in manifold.entities.values()])
         colors = [entity.properties.get("color", "gray") for entity, _ in manifold.entities.values()]
-
-        n = manifold.dimensions
-        if n <= 3 or positions.shape[0] == 0:
-            print("Hypersphere visualization requires more than 3 dimensions and at least one entity.")
-            return
-
-        # Pad positions to 4D if needed
-        if positions.shape[1] < 4:
-            positions = np.pad(positions, ((0, 0), (0, 4 - positions.shape[1])), 'constant')
-        elif positions.shape[1] > 4:
-            from sklearn.decomposition import PCA
-            positions = PCA(n_components=4).fit_transform(positions)
-
-        # Stereographic projection from 4D to 3D using quaternion rotation
-        def stereographic_project(points, wx=0, wy=0, wz=0):
-            rot = R.from_euler('xyz', [wx, wy, wz])
-            pts_rot = points.copy()
-            pts_rot[:, :3] = rot.apply(pts_rot[:, :3])
-            w = pts_rot[:, 3:4]
-            denom = 1 - w / manifold.radius
-            denom[denom == 0] = 1e-8
-            projected = manifold.radius * pts_rot[:, :3] / denom
-            return projected
-
-        # Generate axis lines in 4D (from -radius to +radius along each axis)
-        axis_lines_4d = []
-        for axis in range(4):
-            for sign in [-1, 1]:
-                pt1 = np.zeros(4)
-                pt2 = np.zeros(4)
-                pt1[axis] = -manifold.radius
-                pt2[axis] = manifold.radius
-                # For each axis, draw a line from -radius to +radius, all other coords 0
-                axis_lines_4d.append((pt1, pt2))
-
-        # Project axis lines to 3D for initial frame
-        axis_lines_3d = []
-        for pt1, pt2 in axis_lines_4d:
-            proj_line = stereographic_project(np.stack([pt1, pt2]), 0, 0, 0)
-            axis_lines_3d.append(proj_line)
-
-        # Slider values
-        slider_steps = 20
-        angles = np.linspace(0, 2 * np.pi, slider_steps)
-
-        # Precompute all frames for animation (for each combination of wx, wy, wz)
+        entity_names = [entity.common_name for entity, _ in manifold.entities.values()]
+        
+        # Function for stereographic projection from 4D to 3D
+        def stereographic_projection(points_4d, angle):
+            """Project 4D points onto 3D using stereographic projection with 4D rotation"""
+            rotated_points = np.zeros_like(points_4d)
+            for i, point in enumerate(points_4d):
+                x, y, z, w = point
+                # Apply rotation in xw-plane (one of many possible 4D rotations)
+                rotated_points[i, 0] = x * np.cos(angle) - w * np.sin(angle)
+                rotated_points[i, 1] = y
+                rotated_points[i, 2] = z
+                rotated_points[i, 3] = x * np.sin(angle) + w * np.cos(angle)
+            
+            # Stereographic projection from north pole (0,0,0,1)
+            projected_points = np.zeros((len(rotated_points), 3))
+            for i, point in enumerate(rotated_points):
+                x, y, z, w = point
+                # Avoid division by zero when w=1
+                denom = 1.0 - w
+                if abs(denom) < 1e-10:
+                    # Point very close to north pole projects to "infinity"
+                    # Use a large but finite value
+                    factor = 1e10
+                else:
+                    factor = 1.0 / denom
+                
+                projected_points[i] = [x * factor, y * factor, z * factor]
+            
+            return projected_points
+        
+        # Generate points on the hypersphere surface (3-sphere)
+        # We'll use a parametrization that gives a good distribution of points
+        points_per_dim = 15  # Reduce for better performance
+        theta = np.linspace(0, np.pi, points_per_dim)
+        phi = np.linspace(0, 2*np.pi, points_per_dim)
+        chi = np.linspace(0, np.pi, points_per_dim)
+        
+        # Generate a subset of points on the hypersphere for visualization
+        hypersphere_points = []
+        for t in theta[::3]:  # Use stride to reduce point count
+            for p in phi[::3]:
+                for c in chi[::3]:
+                    x = manifold.radius * np.sin(c) * np.sin(p) * np.sin(t)
+                    y = manifold.radius * np.sin(c) * np.sin(p) * np.cos(t)
+                    z = manifold.radius * np.sin(c) * np.cos(p)
+                    w = manifold.radius * np.cos(c)
+                    hypersphere_points.append([x, y, z, w])
+        
+        hypersphere_points = np.array(hypersphere_points)
+        
+        # Create frames for animation
         frames = []
-        for i, wx in enumerate(angles):
-            for j, wy in enumerate(angles):
-                for k, wz in enumerate(angles):
-                    if i == 0 and j == 0 and k == 0:
-                        continue  # skip initial frame
-                    proj = stereographic_project(positions, wx, wy, wz)
-                    # Project axis lines for this rotation
-                    axis_lines_proj = []
-                    for pt1, pt2 in axis_lines_4d:
-                        axis_lines_proj.append(stereographic_project(np.stack([pt1, pt2]), wx, wy, wz))
-                    frame_data = [
+        angles = np.linspace(0, 2*np.pi, 40)  # 40 frames for one full rotation
+        
+        for i, angle in enumerate(angles):
+            projected_entities = stereographic_projection(positions, angle)
+            projected_sphere = stereographic_projection(hypersphere_points, angle)
+            
+            frames.append(
+                go.Frame(
+                    data=[
+                        # Entity points
                         go.Scatter3d(
-                            x=proj[:, 0], y=proj[:, 1], z=proj[:, 2],
+                            x=projected_entities[:, 0], 
+                            y=projected_entities[:, 1], 
+                            z=projected_entities[:, 2],
+                            mode='markers+text',
+                            marker=dict(size=10, color=colors),
+                            text=entity_names,
+                            name="Entities",
+                            hoverinfo="text"
+                        ),
+                        # Hypersphere surface
+                        go.Scatter3d(
+                            x=projected_sphere[:, 0],
+                            y=projected_sphere[:, 1],
+                            z=projected_sphere[:, 2],
                             mode='markers',
-                            marker=dict(size=7, color=colors),
-                            name="Entities"
+                            marker=dict(size=3, color='lightblue', opacity=0.3),
+                            name="Hypersphere",
+                            hoverinfo="none"
                         )
-                    ]
-                    # Add axis lines to frame
-                    for idx, line in enumerate(axis_lines_proj):
-                        frame_data.append(
-                            go.Scatter3d(
-                                x=line[:, 0], y=line[:, 1], z=line[:, 2],
-                                mode='lines',
-                                line=dict(color='black', width=2, dash='dash'),
-                                name=f"Axis {idx//2 + 1}" if idx % 2 == 0 else None,
-                                showlegend=(idx % 2 == 0)
-                            )
-                        )
-                    frames.append(go.Frame(
-                        data=frame_data,
-                        name=f"wx={wx:.2f},wy={wy:.2f},wz={wz:.2f}"
-                    ))
-
-        # Initial projection
-        proj = stereographic_project(positions, 0, 0, 0)
-
-        # Prepare initial axis lines
-        axis_lines_traces = []
-        for idx, line in enumerate(axis_lines_3d):
-            axis_lines_traces.append(
-                go.Scatter3d(
-                    x=line[:, 0], y=line[:, 1], z=line[:, 2],
-                    mode='lines',
-                    line=dict(color='black', width=2, dash='dash'),
-                    name=f"Axis {idx//2 + 1}" if idx % 2 == 0 else None,
-                    showlegend=(idx % 2 == 0)
+                    ],
+                    name=f"frame{i}"
                 )
             )
-
+        
+        # Initial projection (angle=0)
+        initial_projected_entities = stereographic_projection(positions, 0)
+        initial_projected_sphere = stereographic_projection(hypersphere_points, 0)
+        
+        # Create figure
         fig = go.Figure(
             data=[
+                # Entity points
                 go.Scatter3d(
-                    x=proj[:, 0], y=proj[:, 1], z=proj[:, 2],
-                    mode='markers',
-                    marker=dict(size=7, color=colors),
-                    name="Entities"
-                )
-            ] + axis_lines_traces,
-            layout=go.Layout(
-                title=f"{n}D Manifold Stereographic Projection (Quaternion Rotation)",
-                scene=dict(
-                    xaxis_title="X",
-                    yaxis_title="Y",
-                    zaxis_title="Z",
-                    aspectmode='data'
+                    x=initial_projected_entities[:, 0],
+                    y=initial_projected_entities[:, 1], 
+                    z=initial_projected_entities[:, 2],
+                    mode='markers+text',
+                    marker=dict(size=10, color=colors),
+                    text=entity_names,
+                    name="Entities",
+                    hoverinfo="text"
                 ),
-                updatemenus=[
-                    dict(
-                        type="buttons",
-                        showactive=False,
-                        buttons=[
-                            dict(label="Play", method="animate", args=[None, {"frame": {"duration": 50, "redraw": True}, "fromcurrent": True}]),
-                            dict(label="Pause", method="animate", args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}])
-                        ]
-                    )
-                ]
-            ),
+                # Hypersphere surface
+                go.Scatter3d(
+                    x=initial_projected_sphere[:, 0],
+                    y=initial_projected_sphere[:, 1],
+                    z=initial_projected_sphere[:, 2],
+                    mode='markers',
+                    marker=dict(size=3, color='lightblue', opacity=0.3),
+                    name="Hypersphere",
+                    hoverinfo="none"
+                )
+            ],
             frames=frames
         )
-
-        # Add sliders for wx, wy, wz
-        sliders = [
-            dict(
-                steps=[
-                    dict(
-                        method="animate",
-                        args=[
-                            [f"wx={wx:.2f},wy={0:.2f},wz={0:.2f}"],
-                            {"mode": "immediate", "frame": {"duration": 0, "redraw": True}, "transition": {"duration": 0}}
-                        ],
-                        label=f"{wx:.2f}"
-                    ) for wx in angles
-                ],
-                active=0,
-                currentvalue={"prefix": "wx: "}
+        
+        # Add slider
+        fig.update_layout(
+            title="4D Hypersphere (Stereographic Projection)",
+            scene=dict(
+                xaxis_title="X",
+                yaxis_title="Y",
+                zaxis_title="Z",
+                aspectmode='data'
             ),
-            dict(
-                steps=[
-                    dict(
-                        method="animate",
-                        args=[
-                            [f"wx={0:.2f},wy={wy:.2f},wz={0:.2f}"],
-                            {"mode": "immediate", "frame": {"duration": 0, "redraw": True}, "transition": {"duration": 0}}
-                        ],
-                        label=f"{wy:.2f}"
-                    ) for wy in angles
+            updatemenus=[{
+                'type': 'buttons',
+                'buttons': [
+                    {
+                        'label': 'Play',
+                        'method': 'animate',
+                        'args': [None, {'frame': {'duration': 100, 'redraw': True}, 'fromcurrent': True}]
+                    },
+                    {
+                        'label': 'Pause',
+                        'method': 'animate',
+                        'args': [[None], {'frame': {'duration': 0, 'redraw': False}, 'mode': 'immediate'}]
+                    }
                 ],
-                active=0,
-                currentvalue={"prefix": "wy: "}
-            ),
-            dict(
-                steps=[
-                    dict(
-                        method="animate",
-                        args=[
-                            [f"wx={0:.2f},wy={0:.2f},wz={wz:.2f}"],
-                            {"mode": "immediate", "frame": {"duration": 0, "redraw": True}, "transition": {"duration": 0}}
-                        ],
-                        label=f"{wz:.2f}"
-                    ) for wz in angles
+                'direction': 'left',
+                'pad': {'r': 10, 't': 10},
+                'x': 0.1,
+                'y': 0
+            }],
+            sliders=[{
+                'steps': [
+                    {
+                        'method': 'animate',
+                        'label': f'{angle:.2f}',
+                        'args': [
+                            [f'frame{i}'],
+                            {'frame': {'duration': 100, 'redraw': True}, 'mode': 'immediate'}
+                        ]
+                    }
+                    for i, angle in enumerate(angles)
                 ],
-                active=0,
-                currentvalue={"prefix": "wz: "}
-            )
-        ]
-        fig.update_layout(sliders=sliders)
+                'active': 0,
+                'currentvalue': {
+                    'prefix': 'Angle: ',
+                    'visible': True,
+                    'xanchor': 'right'
+                },
+                'transition': {'duration': 300},
+                'pad': {'b': 10, 't': 50},
+                'len': 0.9,
+                'x': 0.1,
+                'y': 0
+            }]
+        )
+        
         fig.show()
 
     def visualize_manifold(self, manifold: Mainfold):
